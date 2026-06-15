@@ -75,18 +75,50 @@ HYDERABAD_LOCATIONS = [
     {"name": "Shamshabad",       "lat": 17.2403, "lng": 78.4294},
 ]
 
-BASE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Mobile Safari/537.36"
-    ),
-    "Accept":           "application/json, text/plain, */*",
-    "Accept-Language":  "en-IN,en;q=0.9",
-    "Accept-Encoding":  "gzip, deflate, br",
-    "Referer":          "https://www.swiggy.com/instamart",
-    "Origin":           "https://www.swiggy.com",
-    "x-requested-with": "XMLHttpRequest",
+# Full browser fingerprint — Swiggy's AWS WAF rejects requests that don't
+# carry these. Mirrors a real Chrome-on-Android session (matches the cookies
+# that Swiggy issues for the mobile-web/"mweb" subplatform).
+USER_AGENT = (
+    "Mozilla/5.0 (Linux; Android 15; Pixel 9) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/149.0.0.0 Mobile Safari/537.36"
+)
+
+# Headers for the JSON API (XHR-style) request.
+API_HEADERS = {
+    "User-Agent":         USER_AGENT,
+    "Accept":             "application/json, text/plain, */*",
+    "Accept-Language":    "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding":    "gzip, deflate, br",
+    "Referer":            "https://www.swiggy.com/instamart/search",
+    "Origin":             "https://www.swiggy.com",
+    "x-requested-with":   "XMLHttpRequest",
+    "content-type":       "application/json",
+    "sec-ch-ua":          '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+    "sec-ch-ua-mobile":   "?1",
+    "sec-ch-ua-platform": '"Android"',
+    "sec-fetch-dest":     "empty",
+    "sec-fetch-mode":     "cors",
+    "sec-fetch-site":     "same-origin",
+    "priority":           "u=1, i",
+}
+
+# Headers for the server-rendered HTML page (document navigation) request.
+HTML_HEADERS = {
+    "User-Agent":                USER_AGENT,
+    "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language":           "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding":           "gzip, deflate, br",
+    "cache-control":             "max-age=0",
+    "Referer":                   "https://www.swiggy.com/",
+    "sec-ch-ua":                 '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+    "sec-ch-ua-mobile":          "?1",
+    "sec-ch-ua-platform":        '"Android"',
+    "sec-fetch-dest":            "document",
+    "sec-fetch-mode":            "navigate",
+    "sec-fetch-site":            "same-origin",
+    "upgrade-insecure-requests": "1",
+    "priority":                  "u=0, i",
 }
 
 
@@ -137,7 +169,6 @@ def load_cookies_from_env() -> dict:
 
 def create_session(cookies: dict) -> requests.Session:
     s = requests.Session()
-    s.headers.update(BASE_HEADERS)
     for name, value in cookies.items():
         s.cookies.set(name, value, domain=".swiggy.com")
     return s
@@ -148,16 +179,61 @@ def create_session(cookies: dict) -> requests.Session:
 def verify_session(s: requests.Session) -> bool:
     """Quick check that the session works before we loop over all locations."""
     try:
-        r = s.get("https://www.swiggy.com/", timeout=10)
+        r = s.get("https://www.swiggy.com/", headers=HTML_HEADERS, timeout=15)
         print(f"  Homepage: HTTP {r.status_code}")
-        return r.ok
+        return r.status_code in (200, 202)
     except requests.RequestException as e:
         print(f"  Warning: {e}")
         return False
 
 
+def extract_initial_state(html: str) -> dict | None:
+    """
+    Pull the SSR'd Redux/preloaded state out of a Swiggy HTML page.
+    Swiggy assigns it to `window.___INITIAL_STATE___ = {...};`.
+    Uses brace-matching so nested objects don't trip up a naive regex.
+    """
+    for marker in ("window.___INITIAL_STATE___", "___INITIAL_STATE___ ="):
+        idx = html.find(marker)
+        if idx == -1:
+            continue
+        start = html.find("{", idx)
+        if start == -1:
+            continue
+        depth, in_str, esc = 0, False, False
+        for i in range(start, len(html)):
+            ch = html[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        blob = html[start:i + 1]
+                        try:
+                            return json.loads(blob)
+                        except json.JSONDecodeError:
+                            return None
+    return None
+
+
 def search(s: requests.Session, loc: dict) -> dict:
-    url = "https://www.swiggy.com/api/instamart/search"
+    """
+    Try the JSON search API first (with the area's lat/lng as params).
+    If the WAF blocks it (403) or it returns HTML, fall back to fetching the
+    server-rendered search page and parsing the embedded INITIAL_STATE.
+    """
+    # ── Attempt 1: JSON API with lat/lng params ──────────────────────────────
+    api_url = "https://www.swiggy.com/api/instamart/search"
     params = {
         "query":          PRODUCT_SEARCH_TERM,
         "pageNumber":     0,
@@ -170,12 +246,30 @@ def search(s: requests.Session, loc: dict) -> dict:
         "storeType":      "INSTAMART",
     }
     try:
-        r = s.get(url, params=params, timeout=20)
-        if r.ok:
+        r = s.get(api_url, params=params, headers=API_HEADERS, timeout=20)
+        if r.ok and "application/json" in r.headers.get("content-type", ""):
             return r.json()
-        return {"_http_error": r.status_code, "_text": r.text[:300]}
+        api_status = r.status_code
     except requests.RequestException as exc:
-        return {"_exception": str(exc)}
+        api_status = f"exc:{exc}"
+
+    # ── Attempt 2: SSR HTML page fallback ────────────────────────────────────
+    html_url = "https://www.swiggy.com/instamart/search"
+    html_params = {"custom_back": "true", "query": PRODUCT_SEARCH_TERM}
+    try:
+        r = s.get(html_url, params=html_params, headers=HTML_HEADERS, timeout=20)
+        if not r.ok:
+            return {"_http_error": r.status_code, "_text": r.text[:200],
+                    "_api_status": api_status}
+        state = extract_initial_state(r.text)
+        if state is None:
+            # Maybe the product name literally appears in the HTML even if we
+            # can't parse state — report that we got a page but no parsable data.
+            return {"_no_state": True, "_api_status": api_status,
+                    "_html_has_product": PRODUCT_KEYWORDS[0] in r.text.lower()}
+        return state
+    except requests.RequestException as exc:
+        return {"_exception": str(exc), "_api_status": api_status}
 
 
 # ── Response parsing ──────────────────────────────────────────────────────────
@@ -280,6 +374,13 @@ def main() -> int:
 
         data = search(s, loc)
 
+        # Show a one-time diagnostic on the very first location so we can see
+        # which path (JSON API vs SSR fallback) is actually working.
+        if i == 1:
+            print(f"\n              [diag] api_status={data.get('_api_status', 'ok-json')}"
+                  f" keys={list(data.keys())[:6]}\n", end="")
+            print(f"  [{i:02d}/{len(HYDERABAD_LOCATIONS)}] {name:<22}", end=" ", flush=True)
+
         if "_http_error" in data or "_exception" in data:
             err = data.get("_http_error") or data.get("_exception")
             body = data.get("_text", "")
@@ -287,6 +388,10 @@ def main() -> int:
             if body:
                 print(f"              Response: {body[:120]}")
             errors.append((name, str(err)))
+        elif "_no_state" in data:
+            has = data.get("_html_has_product")
+            print(f"got HTML page but couldn't parse data (product_in_html={has})")
+            not_listed.append(name)
         else:
             item = find_product(data)
             if item is None:
