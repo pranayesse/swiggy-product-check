@@ -7,21 +7,26 @@ Swiggy Instamart across 30 Hyderabad areas.
 
 Requires your real Swiggy session cookies (Swiggy's API blocks plain requests).
 
-OPTION 1 — paste cookies directly (easiest):
-    python check_availability.py --cookies "deviceId=...; tid=...; ..."
+HOW TO GET COOKIES:
+  1. Open swiggy.com in Chrome, browse Instamart a little.
+  2. Press F12 → Network tab.
+  3. Click any request to www.swiggy.com → Headers → Request Headers.
+  4. Find the "cookie" row and copy its entire value.
 
-    How to get the cookie string:
-      1. Open swiggy.com in Chrome, browse Instamart a little.
-      2. Press F12 → Network tab.
-      3. Click any request to swiggy.com → Headers → Request Headers.
-      4. Find the "cookie" row and copy its entire value.
-      5. Paste it after --cookies (wrap in quotes).
+OPTION 1 — cookie file (most reliable, avoids shell quoting issues):
+    Paste the cookie string into a file called cookies.txt, then:
+    python check_availability.py --cookies-file cookies.txt
 
-OPTION 2 — env var:
-    export SWIGGY_COOKIES="deviceId=...; tid=...; ..."
+OPTION 2 — paste directly (use SINGLE quotes to prevent shell expansion):
+    python check_availability.py --cookies 'deviceId=...; tid=...; ...'
+    *** IMPORTANT: use single quotes ' not double quotes " ***
+    (double quotes cause $ signs in GA values to be eaten by the shell)
+
+OPTION 3 — env var:
+    export SWIGGY_COOKIES='deviceId=...; tid=...; ...'
     python check_availability.py
 
-OPTION 3 — auto-load from Chrome (must have browser_cookie3 installed):
+OPTION 4 — auto-load from Chrome:
     pip install browser-cookie3
     python check_availability.py
 """
@@ -209,7 +214,12 @@ def main() -> int:
     parser.add_argument(
         "--cookies",
         metavar="COOKIE_STRING",
-        help='Cookie string copied from Chrome DevTools Request Headers (e.g. "deviceId=...; tid=...")',
+        help="Cookie string from Chrome DevTools. Use SINGLE quotes to avoid shell expansion of $ signs.",
+    )
+    parser.add_argument(
+        "--cookies-file",
+        metavar="FILE",
+        help="Path to a file containing the cookie string (avoids all shell quoting issues).",
     )
     args = parser.parse_args()
 
@@ -217,12 +227,29 @@ def main() -> int:
     print("  Natch Thai Dry Mango Slices: Chili — Hyderabad Availability")
     print("=" * 64)
 
-    # Load cookies: --cookies flag > browser > env var
+    # Load cookies: --cookies-file > --cookies > browser > env var
     print("\nLoading Swiggy session cookies …")
-    if args.cookies:
+    if args.cookies_file:
+        try:
+            raw = open(args.cookies_file).read().strip()
+            cookies = parse_cookie_string(raw, f"file {args.cookies_file}")
+        except OSError as e:
+            print(f"  ERROR reading {args.cookies_file}: {e}")
+            return 1
+    elif args.cookies:
         cookies = parse_cookie_string(args.cookies, "--cookies flag")
     else:
         cookies = load_cookies_from_browser() or load_cookies_from_env()
+
+    if cookies and len(cookies) < 5:
+        print(
+            f"\n  WARNING: Only {len(cookies)} cookie(s) loaded — expected 20+.\n"
+            "  The shell probably ate the rest due to $ expansion.\n"
+            "  FIX: Save the cookie string to cookies.txt and run:\n"
+            "       python check_availability.py --cookies-file cookies.txt\n"
+            "  OR use single quotes:  --cookies 'deviceId=...; ...'\n"
+        )
+        return 1
 
     if not cookies:
         print(
