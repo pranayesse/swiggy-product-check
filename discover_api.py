@@ -2,18 +2,15 @@
 """
 discover_api.py
 ---------------
-Diagnostic: opens Swiggy Instamart in a real browser, performs a search the
-normal way (by navigating the site), and records the ACTUAL network requests
-the page makes — so we can see the real search-API endpoint, method, params
-and response shape instead of guessing.
+Diagnostic: opens Swiggy Instamart in a real browser and records ALL Instamart
+API calls the page makes, focusing on:
+  (a) the search endpoint, and
+  (b) any endpoint that resolves a STORE ID from a location (lat/lng),
+which we need in order to check availability across different areas.
 
 RUN:
     python3 discover_api.py --cookies-file cookies.txt
-    # add --headed to watch the browser
-
-It prints every JSON/API response whose URL or body looks related to search,
-including the request method, full URL, any POST body, and whether the product
-name shows up in the response.
+    # add --headed to watch
 """
 
 import argparse
@@ -29,6 +26,9 @@ from check_availability import (
     load_cookies_from_env,
 )
 
+STORE_KEYS = {"storeid", "primarystoreid", "secondarystoreid", "store_id",
+              "primary_store_id", "merchantid", "merchant_id"}
+
 
 def load_cookies(args) -> dict:
     if args.cookies_file:
@@ -37,6 +37,20 @@ def load_cookies(args) -> dict:
     if args.cookies:
         return parse_cookie_string(args.cookies, "--cookies flag")
     return load_cookies_from_browser() or load_cookies_from_env()
+
+
+def find_store_ids(obj, found: dict, depth=0):
+    """Recursively collect any store-id-like key/value pairs."""
+    if depth > 12 or len(found) > 20:
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(k, str) and k.lower() in STORE_KEYS and isinstance(v, (str, int)) and str(v) not in ("", "0"):
+                found[k] = v
+            find_store_ids(v, found, depth + 1)
+    elif isinstance(obj, list):
+        for e in obj[:20]:
+            find_store_ids(e, found, depth + 1)
 
 
 def main() -> int:
@@ -53,7 +67,7 @@ def main() -> int:
         print("No cookies. Use --cookies-file cookies.txt")
         return 1
 
-    captured = []  # (method, url, post_data, status, has_product, snippet)
+    calls = []  # dicts with method,url,post,status,store_ids,has_product
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not args.headed)
@@ -72,81 +86,74 @@ def main() -> int:
 
         def on_response(resp):
             url = resp.url
-            if "swiggy.com" not in url:
+            if "swiggy.com" not in url or ("/api/instamart" not in url and "/dapi/instamart" not in url):
                 return
-            # Only care about API-ish calls
-            if "/api/" not in url and "/dapi/" not in url:
-                return
+            store_ids, has_product = {}, False
             try:
-                ctype = resp.headers.get("content-type", "")
-            except Exception:
-                ctype = ""
-            body_snippet, has_product = "", False
-            if "json" in ctype:
-                try:
+                if "json" in resp.headers.get("content-type", ""):
                     text = resp.text()
-                    low = text.lower()
-                    has_product = all(k in low for k in PRODUCT_KEYWORDS)
-                    # flag anything that looks like search/product results
-                    if has_product or "search" in url.lower() or "instamart" in url.lower():
-                        body_snippet = text[:200]
-                except Exception:
-                    pass
+                    has_product = all(k in text.lower() for k in PRODUCT_KEYWORDS)
+                    try:
+                        find_store_ids(json.loads(text), store_ids)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             req = resp.request
             post = None
             try:
                 post = req.post_data
             except Exception:
                 pass
-            # Record search/product-related calls only
-            if has_product or "search" in url.lower():
-                captured.append((req.method, url, post, resp.status, has_product,
-                                 body_snippet))
+            calls.append({"method": req.method, "url": url, "post": post,
+                          "status": resp.status, "store_ids": store_ids,
+                          "has_product": has_product})
 
         page.on("response", on_response)
 
-        print("Loading Instamart …")
+        print("Loading Instamart (this resolves your store) …")
         page.goto("https://www.swiggy.com/instamart",
                   wait_until="domcontentloaded", timeout=45000)
-        time.sleep(5)
+        time.sleep(6)
 
-        print(f"Navigating to search for '{PRODUCT_SEARCH_TERM}' …")
+        print(f"Searching for '{PRODUCT_SEARCH_TERM}' …")
         page.goto(
             f"https://www.swiggy.com/instamart/search?custom_back=true&query={PRODUCT_SEARCH_TERM.replace(' ', '+')}",
             wait_until="domcontentloaded", timeout=45000)
         time.sleep(6)
 
-        # Also try typing into the search box, in case results load via XHR
-        try:
-            box = page.query_selector("input[type='text'], input[type='search']")
-            if box:
-                box.click()
-                box.fill(PRODUCT_SEARCH_TERM)
-                time.sleep(1)
-                page.keyboard.press("Enter")
-                time.sleep(6)
-        except Exception as e:
-            print(f"  (search box interaction skipped: {e})")
-
         browser.close()
 
-    print("\n" + "=" * 70)
-    print("  CAPTURED SEARCH-RELATED API CALLS")
-    print("=" * 70)
-    if not captured:
-        print("\n  None captured. The results may load from a differently-named "
-              "endpoint.\n  Re-run with --headed and watch the Network tab, or tell me.")
-        return 1
+    # ── Report ────────────────────────────────────────────────────────────────
+    print("\n" + "=" * 74)
+    print("  ALL INSTAMART API CALLS")
+    print("=" * 74)
+    for c in calls:
+        path = c["url"].split("?")[0].replace("https://www.swiggy.com", "")
+        qkeys = ""
+        if "?" in c["url"]:
+            qkeys = " ?" + "&".join(kv.split("=")[0] for kv in c["url"].split("?", 1)[1].split("&"))
+        flags = []
+        if c["has_product"]:
+            flags.append("HAS_PRODUCT")
+        if c["store_ids"]:
+            flags.append(f"STORE_IDS={c['store_ids']}")
+        flag_str = ("  <<< " + " | ".join(flags)) if flags else ""
+        print(f"\n  [{c['method']}] {c['status']}  {path}{qkeys}{flag_str}")
+        if c["post"]:
+            print(f"      body: {c['post'][:200]}")
 
-    seen = set()
-    for method, url, post, status, has_product, snippet in captured:
-        key = (method, url.split("?")[0])
-        flag = "  <-- CONTAINS PRODUCT" if has_product else ""
-        print(f"\n  [{method}] {status}  {url}{flag}")
-        if post:
-            print(f"      POST body: {post[:300]}")
-        if snippet:
-            print(f"      Response:  {snippet}")
+    print("\n" + "=" * 74)
+    print("  STORE-ID-BEARING ENDPOINTS (these tell us how location maps to a store)")
+    print("=" * 74)
+    any_store = False
+    for c in calls:
+        if c["store_ids"]:
+            any_store = True
+            path = c["url"].split("?")[0].replace("https://www.swiggy.com", "")
+            print(f"  [{c['method']}] {path}  ->  {c['store_ids']}")
+    if not any_store:
+        print("  (none found — tell me and I'll widen the search)")
     print()
     return 0
 
