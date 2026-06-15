@@ -26,6 +26,9 @@ from check_availability import (
     load_cookies_from_env,
 )
 
+# Canonical item id for "Natch Thai Dry Mango Slices: Chili"
+ITEM_ID = "M0FVC4UPKJ"
+
 STORE_KEYS = {"storeid", "primarystoreid", "secondarystoreid", "store_id",
               "primary_store_id", "merchantid", "merchant_id"}
 
@@ -120,6 +123,11 @@ def main() -> int:
         page.goto(
             f"https://www.swiggy.com/instamart/search?custom_back=true&query={PRODUCT_SEARCH_TERM.replace(' ', '+')}",
             wait_until="domcontentloaded", timeout=45000)
+        time.sleep(6)
+
+        print(f"Opening item page {ITEM_ID} …")
+        page.goto(f"https://www.swiggy.com/instamart/item/{ITEM_ID}",
+                  wait_until="domcontentloaded", timeout=45000)
         time.sleep(6)
 
         browser.close()
