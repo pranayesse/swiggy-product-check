@@ -5,24 +5,28 @@ check_availability.py
 Checks where "Natch Thai Dry Mango Slices: Chili" is in stock on
 Swiggy Instamart across 30 Hyderabad areas.
 
-Requires your real Swiggy session cookies (the API blocks plain requests).
-The script loads them automatically from your Chrome/Firefox browser via
-browser_cookie3 — just make sure you're logged into swiggy.com in your
-browser before running.
+Requires your real Swiggy session cookies (Swiggy's API blocks plain requests).
 
-    pip install requests browser-cookie3
+OPTION 1 — paste cookies directly (easiest):
+    python check_availability.py --cookies "deviceId=...; tid=...; ..."
+
+    How to get the cookie string:
+      1. Open swiggy.com in Chrome, browse Instamart a little.
+      2. Press F12 → Network tab.
+      3. Click any request to swiggy.com → Headers → Request Headers.
+      4. Find the "cookie" row and copy its entire value.
+      5. Paste it after --cookies (wrap in quotes).
+
+OPTION 2 — env var:
+    export SWIGGY_COOKIES="deviceId=...; tid=...; ..."
     python check_availability.py
 
-If auto-loading fails, set the SWIGGY_COOKIES env var with your cookie string:
-
-    export SWIGGY_COOKIES="_soc=...; deviceId=...; ..."
+OPTION 3 — auto-load from Chrome (must have browser_cookie3 installed):
+    pip install browser-cookie3
     python check_availability.py
-
-To copy your cookie string:
-  Chrome → swiggy.com → F12 → Network tab → any /api/instamart request
-           → Headers → Request Headers → copy the "cookie:" value
 """
 
+import argparse
 import json
 import os
 import sys
@@ -106,19 +110,24 @@ def load_cookies_from_browser() -> dict:
     return {}
 
 
-def load_cookies_from_env() -> dict:
-    """Parse SWIGGY_COOKIES env var (semicolon-separated key=value pairs)."""
-    raw = os.environ.get("SWIGGY_COOKIES", "").strip()
-    if not raw:
-        return {}
+def parse_cookie_string(raw: str, source: str) -> dict:
+    """Parse a semicolon-separated cookie string into a dict."""
     cookies = {}
     for part in raw.split(";"):
         part = part.strip()
         if "=" in part:
             k, _, v = part.partition("=")
             cookies[k.strip()] = v.strip()
-    print(f"  Loaded {len(cookies)} cookies from SWIGGY_COOKIES env var")
+    if cookies:
+        print(f"  Loaded {len(cookies)} cookies from {source}")
     return cookies
+
+
+def load_cookies_from_env() -> dict:
+    raw = os.environ.get("SWIGGY_COOKIES", "").strip()
+    if not raw:
+        return {}
+    return parse_cookie_string(raw, "SWIGGY_COOKIES env var")
 
 
 def create_session(cookies: dict) -> requests.Session:
@@ -196,29 +205,36 @@ def is_in_stock(item: dict) -> bool:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Check Swiggy Instamart availability across Hyderabad")
+    parser.add_argument(
+        "--cookies",
+        metavar="COOKIE_STRING",
+        help='Cookie string copied from Chrome DevTools Request Headers (e.g. "deviceId=...; tid=...")',
+    )
+    args = parser.parse_args()
+
     print("=" * 64)
     print("  Natch Thai Dry Mango Slices: Chili — Hyderabad Availability")
     print("=" * 64)
 
-    # Load cookies (browser > env var)
+    # Load cookies: --cookies flag > browser > env var
     print("\nLoading Swiggy session cookies …")
-    cookies = load_cookies_from_browser() or load_cookies_from_env()
+    if args.cookies:
+        cookies = parse_cookie_string(args.cookies, "--cookies flag")
+    else:
+        cookies = load_cookies_from_browser() or load_cookies_from_env()
 
     if not cookies:
         print(
             "\n  ERROR: No Swiggy cookies found.\n"
-            "  Swiggy's API requires a real browser session. Fix options:\n\n"
-            "  Option 1 (automatic):\n"
-            "    1. Open swiggy.com in Chrome and browse Instamart briefly.\n"
-            "    2. pip install browser-cookie3\n"
-            "    3. Re-run this script — cookies are read from Chrome automatically.\n\n"
-            "  Option 2 (manual):\n"
-            "    1. Open swiggy.com in Chrome, press F12, go to Network tab.\n"
-            "    2. Search for any product on Instamart.\n"
-            "    3. Click any /api/instamart/search request > Headers.\n"
-            "    4. Copy the 'cookie:' value.\n"
-            "    5. Run: export SWIGGY_COOKIES='<paste here>'\n"
-            "       python check_availability.py\n"
+            "  Swiggy blocks requests without a real browser session.\n\n"
+            "  EASIEST FIX:\n"
+            "    1. Open swiggy.com in Chrome and browse Instamart a little.\n"
+            "    2. Press F12 → Network tab.\n"
+            "    3. Click any request to www.swiggy.com → Headers → Request Headers.\n"
+            "    4. Find the 'cookie' row and copy its entire value.\n"
+            "    5. Run:\n"
+            '       python check_availability.py --cookies "paste_the_cookie_value_here"\n'
         )
         return 1
 
