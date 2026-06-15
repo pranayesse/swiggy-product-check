@@ -5,16 +5,26 @@ check_availability.py
 Checks where "Natch Thai Dry Mango Slices: Chili" is in stock on
 Swiggy Instamart across 30 Hyderabad areas.
 
-Run this from your local machine (must have internet access to swiggy.com):
+Requires your real Swiggy session cookies (the API blocks plain requests).
+The script loads them automatically from your Chrome/Firefox browser via
+browser_cookie3 — just make sure you're logged into swiggy.com in your
+browser before running.
 
-    pip install requests
+    pip install requests browser-cookie3
     python check_availability.py
 
-The script searches for the product at each location's coordinates using
-Swiggy's Instamart search API and reports which areas have it in stock.
+If auto-loading fails, set the SWIGGY_COOKIES env var with your cookie string:
+
+    export SWIGGY_COOKIES="_soc=...; deviceId=...; ..."
+    python check_availability.py
+
+To copy your cookie string:
+  Chrome → swiggy.com → F12 → Network tab → any /api/instamart request
+           → Headers → Request Headers → copy the "cookie:" value
 """
 
 import json
+import os
 import sys
 import time
 
@@ -56,30 +66,76 @@ HYDERABAD_LOCATIONS = [
     {"name": "Shamshabad",       "lat": 17.2403, "lng": 78.4294},
 ]
 
+BASE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Mobile Safari/537.36"
+    ),
+    "Accept":           "application/json, text/plain, */*",
+    "Accept-Language":  "en-IN,en;q=0.9",
+    "Accept-Encoding":  "gzip, deflate, br",
+    "Referer":          "https://www.swiggy.com/instamart",
+    "Origin":           "https://www.swiggy.com",
+    "x-requested-with": "XMLHttpRequest",
+}
 
-def create_session() -> requests.Session:
+
+# ── Cookie loading ────────────────────────────────────────────────────────────
+
+def load_cookies_from_browser() -> dict:
+    """Try to read Swiggy cookies from Chrome then Firefox via browser_cookie3."""
+    try:
+        import browser_cookie3
+    except ImportError:
+        return {}
+
+    for loader, name in [
+        (browser_cookie3.chrome,  "Chrome"),
+        (browser_cookie3.firefox, "Firefox"),
+    ]:
+        try:
+            jar = loader(domain_name=".swiggy.com")
+            cookies = {c.name: c.value for c in jar}
+            if cookies:
+                print(f"  Loaded {len(cookies)} cookies from {name}: {list(cookies.keys())}")
+                return cookies
+        except Exception as exc:
+            print(f"  {name} cookie load failed: {exc}")
+
+    return {}
+
+
+def load_cookies_from_env() -> dict:
+    """Parse SWIGGY_COOKIES env var (semicolon-separated key=value pairs)."""
+    raw = os.environ.get("SWIGGY_COOKIES", "").strip()
+    if not raw:
+        return {}
+    cookies = {}
+    for part in raw.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            cookies[k.strip()] = v.strip()
+    print(f"  Loaded {len(cookies)} cookies from SWIGGY_COOKIES env var")
+    return cookies
+
+
+def create_session(cookies: dict) -> requests.Session:
     s = requests.Session()
-    s.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Mobile Safari/537.36"
-        ),
-        "Accept":          "application/json, text/plain, */*",
-        "Accept-Language": "en-IN,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer":         "https://www.swiggy.com/instamart",
-        "Origin":          "https://www.swiggy.com",
-        "x-requested-with": "XMLHttpRequest",
-    })
+    s.headers.update(BASE_HEADERS)
+    for name, value in cookies.items():
+        s.cookies.set(name, value, domain=".swiggy.com")
     return s
 
 
-def warm_session(s: requests.Session) -> bool:
-    """Hit the homepage to pick up session cookies."""
+# ── API calls ─────────────────────────────────────────────────────────────────
+
+def verify_session(s: requests.Session) -> bool:
+    """Quick check that the session works before we loop over all locations."""
     try:
-        r = s.get("https://www.swiggy.com/", timeout=15)
-        print(f"  Homepage: HTTP {r.status_code}  cookies={list(s.cookies.keys())}")
+        r = s.get("https://www.swiggy.com/", timeout=10)
+        print(f"  Homepage: HTTP {r.status_code}")
         return r.ok
     except requests.RequestException as e:
         print(f"  Warning: {e}")
@@ -103,13 +159,14 @@ def search(s: requests.Session, loc: dict) -> dict:
         r = s.get(url, params=params, timeout=20)
         if r.ok:
             return r.json()
-        return {"_http_error": r.status_code, "_text": r.text[:200]}
+        return {"_http_error": r.status_code, "_text": r.text[:300]}
     except requests.RequestException as exc:
         return {"_exception": str(exc)}
 
 
+# ── Response parsing ──────────────────────────────────────────────────────────
+
 def collect_items(obj, depth: int = 0) -> list:
-    """Recursively find item-like dicts in a nested Swiggy API response."""
     if depth > 14:
         return []
     out = []
@@ -126,8 +183,7 @@ def collect_items(obj, depth: int = 0) -> list:
 
 def find_product(data: dict) -> dict | None:
     for item in collect_items(data):
-        name_lower = item.get("name", "").lower()
-        if all(kw in name_lower for kw in PRODUCT_KEYWORDS):
+        if all(kw in item.get("name", "").lower() for kw in PRODUCT_KEYWORDS):
             return item
     return None
 
@@ -137,19 +193,44 @@ def is_in_stock(item: dict) -> bool:
     return bool(val) if isinstance(val, bool) else int(val) != 0
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main() -> int:
     print("=" * 64)
     print("  Natch Thai Dry Mango Slices: Chili — Hyderabad Availability")
     print("=" * 64)
 
-    s = create_session()
-    print("\nWarming session …")
-    warm_session(s)
-    time.sleep(1)
+    # Load cookies (browser > env var)
+    print("\nLoading Swiggy session cookies …")
+    cookies = load_cookies_from_browser() or load_cookies_from_env()
+
+    if not cookies:
+        print(
+            "\n  ERROR: No Swiggy cookies found.\n"
+            "  Swiggy's API requires a real browser session. Fix options:\n\n"
+            "  Option 1 (automatic):\n"
+            "    1. Open swiggy.com in Chrome and browse Instamart briefly.\n"
+            "    2. pip install browser-cookie3\n"
+            "    3. Re-run this script — cookies are read from Chrome automatically.\n\n"
+            "  Option 2 (manual):\n"
+            "    1. Open swiggy.com in Chrome, press F12, go to Network tab.\n"
+            "    2. Search for any product on Instamart.\n"
+            "    3. Click any /api/instamart/search request > Headers.\n"
+            "    4. Copy the 'cookie:' value.\n"
+            "    5. Run: export SWIGGY_COOKIES='<paste here>'\n"
+            "       python check_availability.py\n"
+        )
+        return 1
+
+    s = create_session(cookies)
+
+    print("\nVerifying session …")
+    verify_session(s)
+    time.sleep(0.5)
 
     available, out_of_stock, not_listed, errors = [], [], [], []
 
-    print(f"\nChecking {len(HYDERABAD_LOCATIONS)} areas …\n")
+    print(f"\nChecking {len(HYDERABAD_LOCATIONS)} Hyderabad areas …\n")
     for i, loc in enumerate(HYDERABAD_LOCATIONS, 1):
         name = loc["name"]
         print(f"  [{i:02d}/{len(HYDERABAD_LOCATIONS)}] {name:<22}", end=" ", flush=True)
@@ -158,14 +239,17 @@ def main() -> int:
 
         if "_http_error" in data or "_exception" in data:
             err = data.get("_http_error") or data.get("_exception")
+            body = data.get("_text", "")
             print(f"ERROR ({err})")
+            if body:
+                print(f"              Response: {body[:120]}")
             errors.append((name, str(err)))
         else:
             item = find_product(data)
             if item is None:
                 raw = json.dumps(data).lower()
                 if "not_serviceable" in raw or "not serviceable" in raw:
-                    print("Instamart not serviceable")
+                    print("Instamart not serviceable here")
                 else:
                     print("Product not listed in search results")
                 not_listed.append(name)
